@@ -239,6 +239,62 @@
     let currentArticleId = null;
     let currentLayout = localStorage.getItem('blog_layout_mode') || 'grid';
 
+    // URL ของ Google Apps Script Web App สำหรับใช้งานบน Vercel หรือโฮสติ้งภายนอก
+    const GAS_API_URL = "https://script.google.com/macros/s/AKfycbzCxqGZ62s_BNIVKbUTeiqGkAj0m-Om7MkPSDKGcJGQKXFAgspRNcwq_jI_cDxmbI6r/exec";
+
+    function isGasEnvironment() {
+      return typeof google !== 'undefined' && google.script && typeof google.script.run !== 'undefined';
+    }
+
+    async function callApi(action, params = {}) {
+      if (isGasEnvironment()) {
+        return new Promise((resolve, reject) => {
+          const runner = google.script.run
+            .withSuccessHandler(resolve)
+            .withFailureHandler(reject);
+
+          if (action === 'getBlogs') runner.getBlogs();
+          else if (action === 'loginUser') runner.loginUser(params.username, params.password);
+          else if (action === 'likeBlog') runner.likeBlog(params.id);
+          else if (action === 'saveBlog') runner.saveBlog(params.data, params.token);
+          else reject(new Error('Unknown action: ' + action));
+        });
+      }
+
+      // สำหรับรันบน Vercel หรือโฮสติ้งภายนอก
+      try {
+        if (action === 'getBlogs') {
+          const response = await fetch(`${GAS_API_URL}?action=getBlogs&_t=${Date.now()}`);
+          if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+          const res = await response.json();
+          return res.data || (Array.isArray(res) ? res : []);
+        }
+
+        if (action === 'likeBlog') {
+          const response = await fetch(`${GAS_API_URL}?action=likeBlog&id=${encodeURIComponent(params.id)}&_t=${Date.now()}`);
+          if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+          return await response.json();
+        }
+
+        // สำหรับ loginUser และ saveBlog ใช้ POST (ส่งเป็น text/plain ไม่ให้ติด CORS preflight OPTIONS)
+        const response = await fetch(GAS_API_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain;charset=utf-8'
+          },
+          body: JSON.stringify({ action, ...params })
+        });
+        if (!response.ok) throw new Error(`HTTP Error: ${response.status}`);
+        return await response.json();
+      } catch (err) {
+        console.error("API Error:", err);
+        if (err.message && (err.message.includes('Unexpected token') || err.message.includes('Failed to fetch') || err.message.includes('NetworkError'))) {
+          throw new Error('ไม่สามารถเชื่อมต่อฐานข้อมูล Google Apps Script ได้ (กรุณาตรวจสอบว่าตั้งค่าสิทธิ์ Web App ใน Apps Script เป็น "Anyone" หรือยัง)');
+        }
+        throw err;
+      }
+    }
+
     window.addEventListener('DOMContentLoaded', () => {
       const u = localStorage.getItem('app_user');
       const t = localStorage.getItem('app_token');
@@ -695,11 +751,11 @@
       btn.disabled = true;
       btn.innerText = "กำลังตรวจสอบ...";
 
-      google.script.run
-        .withSuccessHandler((res) => {
+      callApi('loginUser', { username: u, password: p })
+        .then((res) => {
           btn.disabled = false;
           btn.innerText = "เข้าสู่ระบบ";
-          if (res.success) {
+          if (res && res.success) {
             sessionUser = res.user;
             sessionToken = res.token;
             localStorage.setItem('app_user', JSON.stringify(sessionUser));
@@ -709,15 +765,14 @@
             resetWriteForm();
             navigate('write');
           } else {
-            Swal.fire({ icon: 'error', title: 'ไม่สำเร็จ', text: res.message });
+            Swal.fire({ icon: 'error', title: 'ไม่สำเร็จ', text: (res && res.message) || 'เข้าสู่ระบบไม่สำเร็จ' });
           }
         })
-        .withFailureHandler((err) => {
+        .catch((err) => {
           btn.disabled = false;
           btn.innerText = "เข้าสู่ระบบ";
           Swal.fire({ icon: 'error', title: 'ผิดพลาด', text: err.message });
-        })
-        .loginUser(u, p);
+        });
     }
 
     function fetchBlogList() {
@@ -729,8 +784,8 @@
       box.classList.add('hidden');
       empty.classList.add('hidden');
 
-      google.script.run
-        .withSuccessHandler((data) => {
+      callApi('getBlogs')
+        .then((data) => {
           rawBlogList = data || [];
           filteredBlogList = [...rawBlogList];
           loader.classList.add('hidden');
@@ -741,11 +796,25 @@
             renderBlogs();
           }
         })
-        .withFailureHandler((err) => {
-          loader.classList.add('hidden');
-          Swal.fire({ icon: 'error', title: 'ผิดพลาด', text: err.message });
-        })
-        .getBlogs();
+        .catch((err) => {
+          loader.classList.remove('hidden');
+          loader.innerHTML = `
+            <div class="p-6 bg-amber-50 border border-amber-200 rounded-2xl text-amber-900 text-sm max-w-lg mx-auto text-left shadow-sm">
+              <div class="flex items-center gap-2 mb-2 font-bold text-amber-800">
+                <svg class="w-5 h-5 text-amber-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
+                <span>ไม่สามารถโหลดข้อมูลบทความได้</span>
+              </div>
+              <p class="text-xs mb-3 text-amber-700 leading-relaxed">${escapeHtml(err.message || String(err))}</p>
+              <div class="text-xs text-slate-600 border-t border-amber-200/60 pt-3">
+                <p class="font-medium text-slate-700 mb-1">💡 วิธีแก้ไขเมื่อเปิดบน Vercel:</p>
+                <ol class="list-decimal pl-4 space-y-1 text-slate-600">
+                  <li>เปิด Google Apps Script &gt; กด <b>การทำให้ใช้งานได้ (Deploy)</b> &gt; <b>จัดการการทำให้ใช้งานได้ (Manage deployments)</b></li>
+                  <li>กดรูปดินสอเพื่อแก้ไข และตั้งค่า <b>"ผู้มีสิทธิ์เข้าถึง" (Who has access) ให้เป็น "ทุกคน" (Anyone)</b></li>
+                </ol>
+              </div>
+            </div>
+          `;
+        });
     }
 
     function handleLikeClick(id) {
@@ -754,9 +823,9 @@
         return;
       }
 
-      google.script.run
-        .withSuccessHandler((res) => {
-          if (res.success) {
+      callApi('likeBlog', { id })
+        .then((res) => {
+          if (res && res.success) {
             localStorage.setItem('liked_' + id, 'true');
             const b = rawBlogList.find(x => x.id === id);
             if (b) b.likes = res.likes;
@@ -768,7 +837,7 @@
             renderBlogs();
           }
         })
-        .likeBlog(id);
+        .catch((err) => console.error(err));
     }
 
     function shareBlogPost(id) {
@@ -870,23 +939,26 @@
 
       const btn = document.getElementById('btn-save');
       btn.disabled = true;
-      btn.innerText = "กำลังบันทึก...";
+      btn.innerText = "กำลังบันทึกข้อมูลและอัปโหลดรูปภาพ...";
 
-      google.script.run
-        .withSuccessHandler((res) => {
+      callApi('saveBlog', { data: payload, token: sessionToken })
+        .then((res) => {
           btn.disabled = false;
           btn.innerText = "บันทึกบทความ";
-          Swal.fire({ icon: 'success', title: res.message || 'บันทึกสำเร็จ', timer: 1500, showConfirmButton: false });
-          resetWriteForm();
-          navigate('home');
-          fetchBlogList();
+          if (res && res.success) {
+            Swal.fire({ icon: 'success', title: res.message || 'บันทึกสำเร็จ', timer: 1500, showConfirmButton: false });
+            resetWriteForm();
+            navigate('home');
+            fetchBlogList();
+          } else {
+            Swal.fire({ icon: 'error', title: 'บันทึกล้มเหลว', text: (res && res.message) || 'บันทึกไม่สำเร็จ' });
+          }
         })
-        .withFailureHandler((err) => {
+        .catch((err) => {
           btn.disabled = false;
           btn.innerText = "บันทึกบทความ";
           Swal.fire({ icon: 'error', title: 'บันทึกล้มเหลว', text: err.message });
-        })
-        .saveBlog(payload, sessionToken);
+        });
     }
 
     function escapeHtml(text) {
